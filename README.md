@@ -1,6 +1,6 @@
 # Shallow- and Deep-fake Image Manipulation Localization Using Deep Learning
 
-This is the repository for paper [Shallow- and Deep-fake Image Manipulation Localization Using Deep Learning]() submitted to ICNC 2023.
+This is the repository for paper [Shallow- and Deep-fake Image Manipulation Localization Using Deep Learning]() accepted to ICNC 2023.
 
 ![](./github/network.png)
 
