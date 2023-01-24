@@ -1,9 +1,10 @@
 import os
 
+import torch
 import torch.nn as nn
 
 # multiprocessing
-import torch.distributed as dist
+from utils.dist import *
 
 from train_base import *
 
@@ -15,51 +16,52 @@ def main():
     args = parse_args()
 
     # Init dist
-    local_rank = int(os.environ["LOCAL_RANK"])
-    global_rank = int(os.environ["RANK"])
-    world_size = int(os.environ['WORLD_SIZE'])
+    init_dist('slurm', 13721)
 
-    args = init_env(args, local_rank, global_rank)
+    global_rank, world_size = get_dist_info()
 
-    # Init the process group
-    print('Initializing Process Group...')
-    dist.init_process_group(backend=args.dist_backend, init_method=("env://%s:%s" % (args.master_addr, args.master_port)),
-        world_size=world_size, rank=global_rank)
-    print('Process group ready!')
+    args, checkpoint_dir = init_env_multi(args, global_rank)
 
+    # models
     model = init_models(args)
     model = load_dicts(args, model)
     
     # Wrap the model
-    model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    model = nn.parallel.DistributedDataParallel(model, device_ids=[torch.cuda.current_device()], find_unused_parameters=True)
 
     optimizer = init_optims(args, world_size, model)
 
     lr_scheduler = init_schedulers(args, optimizer)
 
-    # resume from saved state if one exists
-    state, checkpoint_dir = load_state(args, global_rank,
-                                       model,
-                                       optimizer,
-                                       lr_scheduler)
-    
-    model = state.model
-    optimizer = state.optimizer
-    lr_scheduler = state.scheduler
+    if (args.cond_state is not None):
+        saved_state = torch.load(args.cond_state)
+
+        optimizer.load_state_dict(saved_state['optimizer'])
+        lr_scheduler.load_state_dict(saved_state['lr_scheduler'])
+
+        prev_best_val_loss = saved_state['best_val_loss']
+
+        # move to device
+        device = torch.device('cuda:' + str(torch.cuda.current_device()))
+
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+    else:
+        prev_best_val_loss = None
 
     # dataset
-    train_sampler, dataloader = init_dataset(args, state, global_rank, world_size)
-    val_sampler, val_dataloader = init_dataset(args, state, global_rank, world_size, True)
-
-    state.paths_file = dataloader.dataset.save_path
-    state.val_paths_file = val_dataloader.dataset.save_path
+    train_sampler, dataloader = init_dataset(args, global_rank, world_size, False)
+    val_sampler, val_dataloader = init_dataset(args, global_rank, world_size, True)
 
     train(args, global_rank, world_size, SYNC, GET_MODULE,
-            state, checkpoint_dir,
+            checkpoint_dir,
             model,
             train_sampler, dataloader, val_sampler, val_dataloader,
             optimizer,
-            lr_scheduler)
+            lr_scheduler,
+            prev_best_val_loss)
 
 if __name__ == '__main__':
     main()

@@ -15,7 +15,6 @@ from torch.utils.tensorboard import SummaryWriter
 from models.mvssnet import get_mvss
 from models.upernet import EncoderDecoder
 from datasets.dataset import *
-from utils.state import State
 from utils.losses import *
 
 # for dice loss
@@ -55,13 +54,13 @@ def parse_args():
     parser.add_argument("--id", type=int, help="unique ID from Slurm")
     parser.add_argument("--run_name", type=str, default="MVSS-Net", help="run name")
 
+    parser.add_argument("--seed", type=int, default=3721, help="seed")
+
     ## multiprocessing
     parser.add_argument('--dist_backend', default='nccl', choices=['gloo', 'nccl'], help='multiprocessing backend')
     parser.add_argument('--master_addr', type=str, default="127.0.0.1", help='address')
     parser.add_argument('--master_port', type=int, default=3721, help='address')
     parser.add_argument('--local_rank', default=0, type=int, help='local rank')
-
-    parser.add_argument('--state_epoch', default=1, type=int, help='number of epochs to save state')
     
     ## dataset
     parser.add_argument("--paths_file", type=str, default="/dataset/files.txt", help="path to the file with input paths") # each line of this file should contain "/path/to/image.ext /path/to/mask.ext /path/to/edge.ext 1 (for fake)/0 (for real)"; for real image.ext, set /path/to/mask.ext and /path/to/edge.ext as a string None
@@ -104,8 +103,8 @@ def parse_args():
     parser.add_argument("--lambda_clf", type=float, default=0.04, help="image-scale loss weight (beta)")
 
     ## log
+    parser.add_argument('--save_dir', type=str, default='.', help='dir to save checkpoints and logs')
     parser.add_argument("--log_interval", type=int, default=0, help="interval between saving image samples")
-    parser.add_argument("--checkpoint_interval", type=int, default=0, help="batch interval between model checkpoints")
     
     args = parser.parse_args()
 
@@ -115,16 +114,34 @@ def init_env(args, local_rank, global_rank):
     # for debug only
     #torch.autograd.set_detect_anomaly(True)
 
+    torch.cuda.set_device(local_rank)
+
+    args, checkpoint_dir = init_env_multi(args, global_rank)
+
+    return args, checkpoint_dir
+
+def init_env_multi(args, global_rank):
+    setup_for_distributed(global_rank == 0)
+
     if (args.id is None):
         args.id = datetime.now().strftime("%Y%m%d%H%M%S")
 
-    torch.cuda.set_device(local_rank)
-    setup_for_distributed(global_rank == 0)
+    # set random number
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    # checkpoint dir
+    checkpoint_dir = args.save_dir + "/checkpoints/" + str(args.id) + "_" + args.run_name
+    if global_rank == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
 
     # finalizing args, print here
     print(args)
 
-    return args
+    return args, checkpoint_dir
 
 def init_models(args):
     if (args.model == 'mvssnet'):
@@ -145,12 +162,12 @@ def init_models(args):
 
 def init_dataset(args, state, global_rank, world_size, val = False):
     # return None if no validation set provided
-    if (val and state.val_paths_file is None):
+    if (val and args.val_paths_file is None):
         print('No val set!')
         return None, None
     
     dataset = FakeDataset(global_rank,
-                              (state.paths_file if not val else state.val_paths_file),
+                              (args.paths_file if not val else args.val_paths_file),
                               args.image_size,
                               args.id,
                               (args.n_c_samples if not val else args.val_n_c_samples),
@@ -222,15 +239,29 @@ def load_dicts(args,
     return model
 
 # for saving checkpoints
-def save_checkpoints(checkpoint_dir, id, epoch, step, get_module,
+def save_checkpoints(args, checkpoint_dir, id, epoch, save_best, last_best, get_module,
                     model):
     if (get_module):
         net = model.module
     else:
         net = model
 
+    # always remove save last and remove previous
     torch.save(net.state_dict(),
-                os.path.join(checkpoint_dir, str(id) + "_" + str(epoch) + '_' + str(step) + '.pth'))
+                os.path.join(checkpoint_dir, str(id) + "_last_" + str(epoch) + '.pth'))
+
+    last_pth = os.path.join(checkpoint_dir, str(id) + "_last_" + str(epoch - 1) + '.pth')
+    if (os.path.exists(last_pth)):
+        os.remove(last_pth)
+
+    # save best
+    if (save_best):
+        torch.save(net.state_dict(),
+                os.path.join(checkpoint_dir, str(id) + "_best_" + str(epoch) + '.pth'))
+
+        # last_best_pth = os.path.join(checkpoint_dir, str(id) + "_best_" + str(last_best) + '.pth')
+        # if (os.path.exists(last_best_pth)):
+        #     os.remove(last_best_pth)
 
 # a single step of prediction and loss calculation (same for both training and validating)
 def predict_loss(args, data, model,
@@ -286,6 +317,14 @@ def predict_loss(args, data, model,
 
     return loss, weighted_loss_seg, weighted_loss_clf, weighted_loss_edg, in_imgs, in_masks, in_edges, out_masks, out_edges
 
+def reset_optim_lr(optimizer, lr, world_size):
+    local_lr = lr / world_size
+
+    for g in optimizer.param_groups:
+        g['lr'] = local_lr
+
+    return optimizer
+
 def init_early_stopping():
     best_val_loss = float('inf')
     n_last_epochs = 0
@@ -293,55 +332,46 @@ def init_early_stopping():
 
     return best_val_loss, n_last_epochs, early_stopping
 
-# elastic
-def load_state(args, global_rank,
-               model,
-               optimizer,
-               lr_scheduler):
-    # checkpoint dir
-    checkpoint_dir = "checkpoints/" + str(args.id) + "_" + args.run_name
-    if global_rank == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-    state = State(args.cond_epoch,
-                  args.paths_file, args.val_paths_file,
-                  model,
-                  optimizer,
-                  lr_scheduler)
-
-    state_file = os.path.join(checkpoint_dir, 'state.sta')
-    if (os.path.isfile(state_file)):
-        print('Load state from {}'.format(state_file))
-
-        state.load(state_file, global_rank)
+def save_state(checkpoint_dir, id, epoch, last_best,
+                optimizer, lr_scheduler,
+                best_val_loss):
     
-    return state, checkpoint_dir
+    state = {'optimizer': optimizer.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(),
+             'best_val_loss': best_val_loss}
 
-def save_state(checkpoint_dir, state):
-    # save to tmp, then commit by moving the file in case the job gets interrupted while writing the checkpoint
-    state_file = os.path.join(checkpoint_dir, 'state.sta')
-    tmp_file = state_file + '.tmp'
-    
-    torch.save(state.capture_snapshot(), tmp_file)
-    move(tmp_file, state_file)
+    save_best_pth = os.path.join(checkpoint_dir, str(id) + "_best_" + str(epoch) + '_state.pth')
+    torch.save(state, save_best_pth)
 
-    print('State saved for (next) epoch {} in {}'.format(state.epoch, state_file))
+    last_best_pth = os.path.join(checkpoint_dir, str(id) + "_best_" + str(last_best) + '_state.pth')
+    if (os.path.exists(last_best_pth)):
+        os.remove(last_best_pth)
+
+    print('State saved to %s with best val loss %.3e.' % (save_best_pth, best_val_loss))
 
 def train(args, global_rank, world_size, sync, get_module,
-            state, checkpoint_dir,
+            checkpoint_dir,
             model,
             train_sampler, dataloader, val_sampler, val_dataloader,
             optimizer,
-            lr_scheduler):
+            lr_scheduler,
+            prev_best_val_loss):
     # Losses that are built-in in PyTorch
     criterion_BCE = nn.BCEWithLogitsLoss().cuda()
     # tensorboard
     if global_rank == 0:
-        os.makedirs("logs", exist_ok=True)
-        writer = SummaryWriter("logs/" + str(args.id) + "_" + args.run_name)
+        os.makedirs(args.save_dir + "/logs/", exist_ok=True)
+        writer = SummaryWriter(args.save_dir + "/logs/" + str(args.id) + "_" + args.run_name)
 
     # for early stopping
     best_val_loss, n_last_epochs, early_stopping = init_early_stopping()
+
+    last_best = -1
+    new_best = -1
+
+    if (prev_best_val_loss is not None):
+        best_val_loss = prev_best_val_loss
+
+        print("Best val loss set to %.3e" % (prev_best_val_loss))
 
     # for mixed precision training
     scaler = torch.cuda.amp.GradScaler()
@@ -349,7 +379,7 @@ def train(args, global_rank, world_size, sync, get_module,
     # GMP layer
     gmp = nn.MaxPool2d(args.image_size)
 
-    start_epoch = state.epoch
+    start_epoch = args.cond_epoch
     for epoch in range(start_epoch, args.n_epochs):
 
         train_sampler.set_epoch(epoch)
@@ -415,11 +445,6 @@ def train(args, global_rank, world_size, sync, get_module,
                     writer.add_images('Input Edge', in_edges, curr_steps)
                     writer.add_images('Output Edge', out_edges, curr_steps)
 
-                # save model parameters
-                if args.checkpoint_interval != 0 and step % args.checkpoint_interval == 0 and global_rank == 0:
-                    save_checkpoints(checkpoint_dir, args.id, epoch, step, get_module,
-                                    model)
-
         # ------------------
         #  Validation
         # ------------------
@@ -439,11 +464,15 @@ def train(args, global_rank, world_size, sync, get_module,
             if epoch_val_loss <= best_val_loss:
                 best_val_loss = epoch_val_loss
                 n_last_epochs = 0
+
+                new_best = epoch
             else:
                 n_last_epochs += 1
 
                 if (n_last_epochs > args.n_early):
                     early_stopping = True
+        else:
+            new_best = epoch
 
         # ------------------
         #  Step
@@ -504,9 +533,20 @@ def train(args, global_rank, world_size, sync, get_module,
 
             # save model parameters
             if global_rank == 0:
-                save_checkpoints(checkpoint_dir, args.id, epoch, 'end', # set step to a string 'end'
+                save_checkpoints(args, checkpoint_dir, args.id, epoch,
+                                 new_best == epoch, last_best,
                                  get_module,
                                  model)
+
+            # save lr and best val loss
+            if global_rank == 0 and new_best == epoch:
+                save_state(checkpoint_dir, args.id, epoch, last_best,
+                 optimizer, lr_scheduler,
+                 best_val_loss)
+
+            # update last best to new best
+            if global_rank == 0 and new_best == epoch:
+                last_best = new_best
 
         # reset early stopping when learning rate changed
         lr_after_step = optimizer.param_groups[0]['lr']
@@ -519,11 +559,6 @@ def train(args, global_rank, world_size, sync, get_module,
         if (early_stopping):
             print('Early stopping')
             break
-
-        # save state for next epoch
-        if epoch % args.state_epoch == 0 and global_rank == 0:
-            state.epoch = epoch + 1
-            save_state(checkpoint_dir, state)
 
     print('Finished training')
 
