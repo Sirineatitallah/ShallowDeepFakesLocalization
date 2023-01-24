@@ -260,8 +260,8 @@ def save_checkpoints(args, checkpoint_dir, id, epoch, save_best, last_best, get_
 
     # save best
     if (save_best):
-        torch.save(net.state_dict(),
-                os.path.join(checkpoint_dir, str(id) + "_best_" + str(epoch) + '.pth'))
+        save_best_pth = os.path.join(checkpoint_dir, str(id) + "_best_" + str(epoch) + '.pth')
+        torch.save(net.state_dict(), save_best_pth)
 
         # last_best_pth = os.path.join(checkpoint_dir, str(id) + "_best_" + str(last_best) + '.pth')
         # if (os.path.exists(last_best_pth)):

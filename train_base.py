@@ -61,8 +61,7 @@ def parse_args():
 
     ## multiprocessing
     parser.add_argument('--dist_backend', default='nccl', choices=['gloo', 'nccl'], help='multiprocessing backend')
-    parser.add_argument('--master_addr', type=str, default="127.0.0.1", help='address')
-    parser.add_argument('--master_port', type=int, default=3721, help='address')
+    parser.add_argument('--port', type=int, default=3721, help='port')
     parser.add_argument('--local_rank', default=0, type=int, help='local rank')
     
     ## dataset

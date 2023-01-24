@@ -40,6 +40,7 @@ def main():
         lr_scheduler.load_state_dict(saved_state['lr_scheduler'])
 
         prev_best_val_loss = saved_state['best_val_loss']
+        prev_n_last_epochs = saved_state['n_last_epochs']
 
         # move to device
         device = torch.device('cuda:' + str(torch.cuda.current_device()))
@@ -50,6 +51,7 @@ def main():
                     state[k] = v.to(device)
     else:
         prev_best_val_loss = None
+        prev_n_last_epochs = 0
 
     # dataset
     train_sampler, dataloader = init_dataset(args, global_rank, world_size, False)
@@ -61,7 +63,7 @@ def main():
             train_sampler, dataloader, val_sampler, val_dataloader,
             optimizer,
             lr_scheduler,
-            prev_best_val_loss)
+            prev_best_val_loss, prev_n_last_epochs)
 
 if __name__ == '__main__':
     main()
