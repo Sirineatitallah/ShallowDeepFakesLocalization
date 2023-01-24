@@ -4,9 +4,12 @@ import sys
 from shutil import move
 from datetime import datetime
 from contextlib import nullcontext
+import random
+import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # tensorboard
@@ -98,6 +101,8 @@ def parse_args():
     
     parser.add_argument("--n_early", type=int, default=10, help="number of epochs for early stopping")
 
+    parser.add_argument("--cond_state", type=str, help="state file for continued training")
+
     ## losses
     parser.add_argument("--lambda_seg", type=float, default=0.16, help="pixel-scale loss weight (alpha)")
     parser.add_argument("--lambda_clf", type=float, default=0.04, help="image-scale loss weight (beta)")
@@ -160,7 +165,7 @@ def init_models(args):
 
     return model
 
-def init_dataset(args, state, global_rank, world_size, val = False):
+def init_dataset(args, global_rank, world_size, val = False):
     # return None if no validation set provided
     if (val and args.val_paths_file is None):
         print('No val set!')
